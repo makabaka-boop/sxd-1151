@@ -309,7 +309,7 @@ class IncidentUpdate(models.Model):
     old_status = models.CharField(max_length=20, choices=Incident.Status.choices, verbose_name='原状态')
     new_status = models.CharField(max_length=20, choices=Incident.Status.choices, verbose_name='新状态')
     comment = models.TextField(blank=True, verbose_name='备注')
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name='操作时间')
+    created_at = models.DateTimeField(default=timezone.now, verbose_name='操作时间')
 
     class Meta:
         verbose_name = '事件更新记录'

@@ -340,11 +340,11 @@ class ReportViewSet(viewsets.GenericViewSet):
         导出周报（汇总过去7天的数据）
         参数:
             end_date: 结束日期 (YYYY-MM-DD)，默认今日
-            format: 格式，可选 excel 或 pdf，默认 excel
+            file_format: 格式，可选 excel 或 pdf，默认 excel
             pen_id: 栏区ID，可选
         """
         end_date = request.query_params.get('end_date', timezone.now().date().isoformat())
-        format_type = request.query_params.get('format', 'excel').lower()
+        format_type = request.query_params.get('file_format', 'excel').lower()
         pen_id = request.query_params.get('pen_id')
 
         try:
@@ -354,8 +354,6 @@ class ReportViewSet(viewsets.GenericViewSet):
                 {'error': '日期格式错误，请使用 YYYY-MM-DD 格式'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-
-        start_date_obj = end_date_obj - timedelta(days=6)
 
         if format_type not in ['excel', 'pdf']:
             return Response(
@@ -372,15 +370,8 @@ class ReportViewSet(viewsets.GenericViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-        snapshots = []
-        current_date = start_date_obj
-        while current_date <= end_date_obj:
-            snapshot = snapshot_service.calculate_daily_snapshot(current_date, pen_id)
-            snapshots.append(snapshot)
-            current_date += timedelta(days=1)
-
         from .export_service import export_service
-        return export_service.export_daily_report(end_date_obj, format_type, pen_id)
+        return export_service.export_weekly_report(end_date_obj, format_type, pen_id)
 
     @action(detail=False, methods=['get'])
     def available_dates(self, request):

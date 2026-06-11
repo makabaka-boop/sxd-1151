@@ -30,6 +30,7 @@ class InspectionRecordViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, CanSubmitRecords]
     filterset_fields = ['pen_id', 'inspector_id']
     search_fields = ['pen__code', 'pen__name', 'inspector__real_name', 'remarks']
+    http_method_names = ['get', 'post', 'head', 'options']
 
     def get_serializer_class(self):
         if self.action in ['create', 'update', 'partial_update']:
@@ -102,6 +103,7 @@ class FeedingRecordViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, CanSubmitRecords]
     filterset_fields = ['pen_id', 'feeder_id', 'feed_type']
     search_fields = ['pen__code', 'pen__name', 'feed_type', 'feeder__real_name']
+    http_method_names = ['get', 'post', 'head', 'options']
 
     def get_serializer_class(self):
         if self.action in ['create', 'update', 'partial_update']:
@@ -176,6 +178,7 @@ class CleaningRecordViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, CanSubmitRecords]
     filterset_fields = ['pen_id', 'cleaner_id', 'cleaning_type']
     search_fields = ['pen__code', 'pen__name', 'cleaner__real_name', 'disinfectant_used']
+    http_method_names = ['get', 'post', 'head', 'options']
 
     def get_serializer_class(self):
         if self.action in ['create', 'update', 'partial_update']:
@@ -227,6 +230,7 @@ class IncidentViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, CanSubmitRecords]
     filterset_fields = ['pen_id', 'reporter_id', 'handler_id', 'severity', 'status']
     search_fields = ['title', 'description', 'pen__code', 'pen__name', 'reporter__real_name']
+    http_method_names = ['get', 'post', 'head', 'options']
 
     def get_serializer_class(self):
         if self.action in ['create']:

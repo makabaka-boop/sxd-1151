@@ -13,6 +13,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
 from django.http import HttpResponse
+from django.utils import timezone
 from .services import snapshot_service
 
 
@@ -343,6 +344,388 @@ class ExportService:
             return cls.export_daily_report_pdf(target_date, pen_id)
         else:
             return cls.export_daily_report_excel(target_date, pen_id)
+
+    @classmethod
+    def export_weekly_report_excel(cls, end_date, pen_id=None):
+        """导出 Excel 格式的周报（汇总过去7天的数据）"""
+        from datetime import timedelta
+        start_date = end_date - timedelta(days=6)
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = f'巡检周报_{start_date}_to_{end_date}'
+
+        header_font = Font(bold=True, size=14, color='FFFFFF')
+        header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+        sub_header_font = Font(bold=True, size=11)
+        center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        left_align = Alignment(horizontal='left', vertical='center', wrap_text=True)
+        thin_border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+
+        ws.merge_cells('A1:H1')
+        ws.cell(row=1, column=1, value=f'养殖场巡检周报').font = Font(bold=True, size=16)
+        ws.cell(row=1, column=1).alignment = Alignment(horizontal='center', vertical='center')
+
+        ws.merge_cells('A2:H2')
+        ws.cell(row=2, column=1, value=f'统计周期: {start_date} 至 {end_date}').font = Font(size=11, italic=True)
+        ws.cell(row=2, column=1).alignment = Alignment(horizontal='center', vertical='center')
+
+        ws.merge_cells('A3:H3')
+        ws.cell(row=3, column=1, value=f'导出时间: {timezone.now().strftime("%Y-%m-%d %H:%M:%S")}').font = Font(size=10, color='666666')
+        ws.cell(row=3, column=1).alignment = Alignment(horizontal='center', vertical='center')
+
+        row = 5
+
+        ws.merge_cells(f'A{row}:H{row}')
+        ws.cell(row=row, column=1, value='每日汇总').font = sub_header_font
+        row += 1
+
+        daily_headers = ['日期', '巡检完成率', '巡检次数', '喂养次数', '清洁次数', '新增异常', '待处理事件', '整体状态']
+        for col, header in enumerate(daily_headers, 1):
+            cell = ws.cell(row=row, column=col, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center_align
+            cell.border = thin_border
+        row += 1
+
+        daily_snapshots = []
+        current_date = start_date
+        while current_date <= end_date:
+            snapshot = snapshot_service.calculate_daily_snapshot(current_date, pen_id)
+            daily_snapshots.append(snapshot)
+            current_date += timedelta(days=1)
+
+        for snapshot in daily_snapshots:
+            avg_rate = snapshot['average_inspection_completion_rate']
+            total_inspections = sum(s['inspection']['inspection_count'] for s in snapshot['pen_snapshots'])
+            total_feedings = sum(s['feeding']['feeding_count'] for s in snapshot['pen_snapshots'])
+            total_cleanings = sum(s['cleaning']['cleaning_count'] for s in snapshot['pen_snapshots'])
+            new_incidents = sum(s['incidents']['new_today_count'] for s in snapshot['pen_snapshots'])
+            open_incidents = snapshot['total_open_incidents']
+
+            if open_incidents > 0 or snapshot['total_abnormal_count'] > 0:
+                status = '异常'
+                status_color = cls.STATUS_COLORS['WARNING'].lstrip('#')
+            elif avg_rate >= 100:
+                status = '正常'
+                status_color = cls.STATUS_COLORS['NORMAL'].lstrip('#')
+            elif avg_rate >= 80:
+                status = '部分完成'
+                status_color = cls.STATUS_COLORS['PARTIAL'].lstrip('#')
+            else:
+                status = '需关注'
+                status_color = cls.STATUS_COLORS['ATTENTION'].lstrip('#')
+
+            row_data = [
+                snapshot['date'],
+                f'{avg_rate}%',
+                total_inspections,
+                total_feedings,
+                total_cleanings,
+                new_incidents,
+                open_incidents,
+                status
+            ]
+
+            for col, value in enumerate(row_data, 1):
+                cell = ws.cell(row=row, column=col, value=value)
+                cell.alignment = center_align
+                cell.border = thin_border
+                if col == 8:
+                    cell.fill = PatternFill(start_color=status_color, end_color=status_color, fill_type='solid')
+            row += 1
+
+        row += 2
+        ws.merge_cells(f'A{row}:H{row}')
+        ws.cell(row=row, column=1, value='栏区周汇总').font = sub_header_font
+        row += 1
+
+        pen_headers = ['栏区编号', '栏区名称', '平均完成率', '总巡检次数', '总喂养次数', '总清洁次数', '异常事件数', '整体状态']
+        for col, header in enumerate(pen_headers, 1):
+            cell = ws.cell(row=row, column=col, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center_align
+            cell.border = thin_border
+        row += 1
+
+        pen_summary = {}
+        for snapshot in daily_snapshots:
+            for pen_snap in snapshot['pen_snapshots']:
+                pen_id_val = pen_snap['pen_id']
+                if pen_id_val not in pen_summary:
+                    pen_summary[pen_id_val] = {
+                        'pen_code': pen_snap['pen_code'],
+                        'pen_name': pen_snap['pen_name'],
+                        'completion_rates': [],
+                        'total_inspections': 0,
+                        'total_feedings': 0,
+                        'total_cleanings': 0,
+                        'total_incidents': 0
+                    }
+                pen_summary[pen_id_val]['completion_rates'].append(pen_snap['inspection']['completion_rate'])
+                pen_summary[pen_id_val]['total_inspections'] += pen_snap['inspection']['inspection_count']
+                pen_summary[pen_id_val]['total_feedings'] += pen_snap['feeding']['feeding_count']
+                pen_summary[pen_id_val]['total_cleanings'] += pen_snap['cleaning']['cleaning_count']
+                pen_summary[pen_id_val]['total_incidents'] += pen_snap['incidents']['new_today_count']
+
+        for pen_data in pen_summary.values():
+            avg_rate = round(sum(pen_data['completion_rates']) / len(pen_data['completion_rates']), 2) if pen_data['completion_rates'] else 0
+
+            if pen_data['total_incidents'] > 0:
+                status = '异常'
+                status_color = cls.STATUS_COLORS['WARNING'].lstrip('#')
+            elif avg_rate >= 100:
+                status = '正常'
+                status_color = cls.STATUS_COLORS['NORMAL'].lstrip('#')
+            elif avg_rate >= 80:
+                status = '部分完成'
+                status_color = cls.STATUS_COLORS['PARTIAL'].lstrip('#')
+            else:
+                status = '需关注'
+                status_color = cls.STATUS_COLORS['ATTENTION'].lstrip('#')
+
+            row_data = [
+                pen_data['pen_code'],
+                pen_data['pen_name'],
+                f'{avg_rate}%',
+                pen_data['total_inspections'],
+                pen_data['total_feedings'],
+                pen_data['total_cleanings'],
+                pen_data['total_incidents'],
+                status
+            ]
+
+            for col, value in enumerate(row_data, 1):
+                cell = ws.cell(row=row, column=col, value=value)
+                cell.alignment = center_align if col != 2 else left_align
+                cell.border = thin_border
+                if col == 8:
+                    cell.fill = PatternFill(start_color=status_color, end_color=status_color, fill_type='solid')
+            row += 1
+
+        column_widths = [15, 20, 12, 12, 12, 12, 12, 12]
+        for col, width in enumerate(column_widths, 1):
+            ws.column_dimensions[get_column_letter(col)].width = width
+
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        response = HttpResponse(
+            output.getvalue(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        response['Content-Disposition'] = f'attachment; filename="巡检周报_{start_date}_to_{end_date}.xlsx"'
+        return response
+
+    @classmethod
+    def export_weekly_report_pdf(cls, end_date, pen_id=None):
+        """导出 PDF 格式的周报（汇总过去7天的数据）"""
+        from datetime import timedelta
+        start_date = end_date - timedelta(days=6)
+
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=landscape(A4),
+            rightMargin=2 * cm,
+            leftMargin=2 * cm,
+            topMargin=2 * cm,
+            bottomMargin=2 * cm
+        )
+
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=18,
+            alignment=1,
+            spaceAfter=10
+        )
+        section_style = ParagraphStyle(
+            'SectionTitle',
+            parent=styles['Heading2'],
+            fontSize=14,
+            textColor=colors.HexColor('#4472C4'),
+            spaceBefore=10,
+            spaceAfter=10
+        )
+
+        story = []
+
+        story.append(Paragraph(f'养殖场巡检周报', title_style))
+        story.append(Paragraph(f'统计周期: {start_date} 至 {end_date}', styles['Normal']))
+        story.append(Paragraph(f'导出时间: {timezone.now().strftime("%Y-%m-%d %H:%M:%S")}', styles['Normal']))
+        story.append(Spacer(1, 0.5 * cm))
+
+        daily_snapshots = []
+        current_date = start_date
+        while current_date <= end_date:
+            snapshot = snapshot_service.calculate_daily_snapshot(current_date, pen_id)
+            daily_snapshots.append(snapshot)
+            current_date += timedelta(days=1)
+
+        story.append(Paragraph('每日汇总', section_style))
+
+        daily_data = [['日期', '巡检完成率', '巡检次数', '喂养次数', '清洁次数', '新增异常', '待处理事件', '整体状态']]
+
+        for snapshot in daily_snapshots:
+            avg_rate = snapshot['average_inspection_completion_rate']
+            total_inspections = sum(s['inspection']['inspection_count'] for s in snapshot['pen_snapshots'])
+            total_feedings = sum(s['feeding']['feeding_count'] for s in snapshot['pen_snapshots'])
+            total_cleanings = sum(s['cleaning']['cleaning_count'] for s in snapshot['pen_snapshots'])
+            new_incidents = sum(s['incidents']['new_today_count'] for s in snapshot['pen_snapshots'])
+            open_incidents = snapshot['total_open_incidents']
+
+            if open_incidents > 0 or snapshot['total_abnormal_count'] > 0:
+                status = '异常'
+                status_color = cls.STATUS_COLORS['WARNING']
+            elif avg_rate >= 100:
+                status = '正常'
+                status_color = cls.STATUS_COLORS['NORMAL']
+            elif avg_rate >= 80:
+                status = '部分完成'
+                status_color = cls.STATUS_COLORS['PARTIAL']
+            else:
+                status = '需关注'
+                status_color = cls.STATUS_COLORS['ATTENTION']
+
+            daily_data.append([
+                snapshot['date'],
+                f'{avg_rate}%',
+                str(total_inspections),
+                str(total_feedings),
+                str(total_cleanings),
+                str(new_incidents),
+                str(open_incidents),
+                status
+            ])
+
+        daily_table = Table(daily_data, colWidths=[2.5 * cm] * 8)
+        style_cmds = [
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#4472C4')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]
+
+        for i in range(1, len(daily_data)):
+            status_text = daily_data[i][7]
+            if status_text == '异常':
+                color = cls.STATUS_COLORS['WARNING']
+            elif status_text == '正常':
+                color = cls.STATUS_COLORS['NORMAL']
+            elif status_text == '部分完成':
+                color = cls.STATUS_COLORS['PARTIAL']
+            else:
+                color = cls.STATUS_COLORS['ATTENTION']
+            style_cmds.append(('BACKGROUND', (7, i), (7, i), colors.HexColor(color)))
+
+        daily_table.setStyle(TableStyle(style_cmds))
+        story.append(daily_table)
+        story.append(Spacer(1, 0.8 * cm))
+
+        story.append(Paragraph('栏区周汇总', section_style))
+
+        pen_summary = {}
+        for snapshot in daily_snapshots:
+            for pen_snap in snapshot['pen_snapshots']:
+                pen_id_val = pen_snap['pen_id']
+                if pen_id_val not in pen_summary:
+                    pen_summary[pen_id_val] = {
+                        'pen_code': pen_snap['pen_code'],
+                        'pen_name': pen_snap['pen_name'],
+                        'completion_rates': [],
+                        'total_inspections': 0,
+                        'total_feedings': 0,
+                        'total_cleanings': 0,
+                        'total_incidents': 0
+                    }
+                pen_summary[pen_id_val]['completion_rates'].append(pen_snap['inspection']['completion_rate'])
+                pen_summary[pen_id_val]['total_inspections'] += pen_snap['inspection']['inspection_count']
+                pen_summary[pen_id_val]['total_feedings'] += pen_snap['feeding']['feeding_count']
+                pen_summary[pen_id_val]['total_cleanings'] += pen_snap['cleaning']['cleaning_count']
+                pen_summary[pen_id_val]['total_incidents'] += pen_snap['incidents']['new_today_count']
+
+        pen_data = [['栏区编号', '栏区名称', '平均完成率', '总巡检次数', '总喂养次数', '总清洁次数', '异常事件数', '整体状态']]
+
+        for pen_data_item in pen_summary.values():
+            avg_rate = round(sum(pen_data_item['completion_rates']) / len(pen_data_item['completion_rates']), 2) if pen_data_item['completion_rates'] else 0
+
+            if pen_data_item['total_incidents'] > 0:
+                status = '异常'
+                status_color = cls.STATUS_COLORS['WARNING']
+            elif avg_rate >= 100:
+                status = '正常'
+                status_color = cls.STATUS_COLORS['NORMAL']
+            elif avg_rate >= 80:
+                status = '部分完成'
+                status_color = cls.STATUS_COLORS['PARTIAL']
+            else:
+                status = '需关注'
+                status_color = cls.STATUS_COLORS['ATTENTION']
+
+            pen_data.append([
+                pen_data_item['pen_code'],
+                pen_data_item['pen_name'],
+                f'{avg_rate}%',
+                str(pen_data_item['total_inspections']),
+                str(pen_data_item['total_feedings']),
+                str(pen_data_item['total_cleanings']),
+                str(pen_data_item['total_incidents']),
+                status
+            ])
+
+        pen_table = Table(pen_data, colWidths=[1.6 * cm, 3 * cm, 2 * cm, 2 * cm, 2 * cm, 2 * cm, 2 * cm, 2 * cm])
+        style_cmds_pen = [
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#4472C4')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]
+
+        for i in range(1, len(pen_data)):
+            status_text = pen_data[i][7]
+            if status_text == '异常':
+                color = cls.STATUS_COLORS['WARNING']
+            elif status_text == '正常':
+                color = cls.STATUS_COLORS['NORMAL']
+            elif status_text == '部分完成':
+                color = cls.STATUS_COLORS['PARTIAL']
+            else:
+                color = cls.STATUS_COLORS['ATTENTION']
+            style_cmds_pen.append(('BACKGROUND', (7, i), (7, i), colors.HexColor(color)))
+
+        pen_table.setStyle(TableStyle(style_cmds_pen))
+        story.append(pen_table)
+
+        doc.build(story)
+        buffer.seek(0)
+
+        response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename="巡检周报_{start_date}_to_{end_date}.pdf"'
+        return response
+
+    @classmethod
+    def export_weekly_report(cls, end_date, format_type='excel', pen_id=None):
+        """周报统一导出接口"""
+        if format_type.lower() == 'pdf':
+            return cls.export_weekly_report_pdf(end_date, pen_id)
+        else:
+            return cls.export_weekly_report_excel(end_date, pen_id)
 
 
 export_service = ExportService()

@@ -42,12 +42,10 @@ class IsAdminOrReadOnly(permissions.BasePermission):
 
 
 class CanSubmitRecords(permissions.BasePermission):
-    """可提交记录：管理员和现场人员"""
+    """可提交和查看原始记录：仅管理员和现场人员"""
     def has_permission(self, request, view):
         if not request.user or not request.user.is_authenticated:
             return False
-        if request.method in permissions.SAFE_METHODS:
-            return True
         return request.user.role in [User.Role.ADMIN, User.Role.FIELD_WORKER]
 
 

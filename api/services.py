@@ -89,8 +89,7 @@ class SnapshotService:
         incidents = Incident.objects.filter(
             pen_id__in=pen_ids
         ).filter(
-            Q(incident_time__gte=start_dt, incident_time__lt=end_dt) |
-            Q(status__in=['OPEN', 'IN_PROGRESS'], incident_time__lt=end_dt)
+            incident_time__lt=end_dt
         ).select_related('pen', 'reporter', 'handler').prefetch_related('updates')
 
         inspection_by_pen = defaultdict(list)
@@ -254,27 +253,25 @@ class SnapshotService:
 
     @staticmethod
     def _get_incident_status_at_date(incident, target_date):
-        """计算异常事件在指定日期的状态"""
+        """
+        计算异常事件在指定日期的状态
+        通过 IncidentUpdate 记录来还原历史状态，确保快照准确
+        """
         target_end = datetime.combine(target_date, datetime.max.time())
+        target_end = timezone.make_aware(target_end)
 
-        if incident.incident_time.date() > target_date:
+        if incident.incident_time > target_end:
             return None
-
-        if not incident.resolved_time:
-            return incident.status
-
-        if incident.resolved_time.date() <= target_date:
-            return incident.status
 
         last_update_before = None
         for update in incident.updates.all().order_by('created_at'):
-            if update.created_at.date() <= target_date:
+            if update.created_at <= target_end:
                 last_update_before = update
 
         if last_update_before:
             return last_update_before.new_status
 
-        if incident.created_at.date() <= target_date:
+        if incident.incident_time <= target_end:
             return Incident.Status.OPEN
 
         return None
