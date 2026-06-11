@@ -343,3 +343,185 @@ class DailySnapshot(models.Model):
 
     def __str__(self):
         return f'{self.snapshot_date} - {self.pen_filter_key}'
+
+
+class HealthScoreConfig(models.Model):
+    """
+    健康评分配置 - 管理员可配置权重、风险等级阈值和纳入评分的巡检项
+    """
+    class DimensionKey(models.TextChoices):
+        INSPECTION_ABNORMAL = 'inspection_abnormal', '巡检异常数量'
+        OPEN_INCIDENTS = 'open_incidents', '未处理异常事件'
+        FEEDING_COMPLETION = 'feeding_completion', '喂养完成情况'
+        CLEANING_COMPLETION = 'cleaning_completion', '清洁完成情况'
+        CAPACITY_RATIO = 'capacity_ratio', '存栏容量占比'
+
+    class RiskLevel(models.TextChoices):
+        EXCELLENT = 'EXCELLENT', '优秀'
+        GOOD = 'GOOD', '良好'
+        NORMAL = 'NORMAL', '一般'
+        WARNING = 'WARNING', '警告'
+        DANGER = 'DANGER', '危险'
+
+    dimension_key = models.CharField(max_length=50, choices=DimensionKey.choices, unique=True, verbose_name='评分维度')
+    weight = models.FloatField(default=20.0, verbose_name='权重(%)')
+    is_enabled = models.BooleanField(default=True, verbose_name='是否启用')
+    sort_order = models.IntegerField(default=0, verbose_name='排序')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        verbose_name = '健康评分维度配置'
+        verbose_name_plural = verbose_name
+        ordering = ['sort_order', 'dimension_key']
+
+    def __str__(self):
+        return f'{self.get_dimension_key_display()} (权重: {self.weight}%)'
+
+
+class HealthScoreInspectionItem(models.Model):
+    """
+    纳入评分的巡检项配置 - 管理员可选择哪些巡检项参与评分计算
+    """
+    inspection_item = models.ForeignKey(InspectionItem, on_delete=models.CASCADE, related_name='score_configs', verbose_name='巡检项')
+    penalty_per_abnormal = models.FloatField(default=5.0, verbose_name='每次异常扣分')
+    is_enabled = models.BooleanField(default=True, verbose_name='是否启用')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        verbose_name = '评分巡检项配置'
+        verbose_name_plural = verbose_name
+        ordering = ['inspection_item__sort_order']
+
+    def __str__(self):
+        return f'{self.inspection_item.name} (扣{self.penalty_per_abnormal}分/次)'
+
+
+class HealthScoreRiskThreshold(models.Model):
+    """
+    风险等级阈值配置 - 定义不同评分范围对应的风险等级
+    """
+    class RiskLevel(models.TextChoices):
+        EXCELLENT = 'EXCELLENT', '优秀'
+        GOOD = 'GOOD', '良好'
+        NORMAL = 'NORMAL', '一般'
+        WARNING = 'WARNING', '警告'
+        DANGER = 'DANGER', '危险'
+
+    risk_level = models.CharField(max_length=20, choices=RiskLevel.choices, unique=True, verbose_name='风险等级')
+    min_score = models.FloatField(verbose_name='最低分(含)')
+    max_score = models.FloatField(verbose_name='最高分(不含)')
+    color = models.CharField(max_length=20, default='#00FF00', verbose_name='显示颜色')
+    description = models.TextField(blank=True, verbose_name='描述')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        verbose_name = '风险等级阈值配置'
+        verbose_name_plural = verbose_name
+        ordering = ['-min_score']
+
+    def __str__(self):
+        return f'{self.get_risk_level_display()} ({self.min_score}-{self.max_score})'
+
+
+class HealthScoreRecord(models.Model):
+    """
+    栏区每日健康评分记录 - 系统自动计算，每日每个栏区一条记录
+    """
+    class RiskLevel(models.TextChoices):
+        EXCELLENT = 'EXCELLENT', '优秀'
+        GOOD = 'GOOD', '良好'
+        NORMAL = 'NORMAL', '一般'
+        WARNING = 'WARNING', '警告'
+        DANGER = 'DANGER', '危险'
+
+    score_date = models.DateField(verbose_name='评分日期')
+    pen = models.ForeignKey(Pen, on_delete=models.CASCADE, related_name='health_scores', verbose_name='栏区')
+    total_score = models.FloatField(default=100.0, verbose_name='总分')
+    base_score = models.FloatField(default=100.0, verbose_name='基础分')
+    deduction = models.FloatField(default=0.0, verbose_name='总扣分')
+    addition = models.FloatField(default=0.0, verbose_name='总加分')
+    risk_level = models.CharField(max_length=20, choices=RiskLevel.choices, default=RiskLevel.GOOD, verbose_name='风险等级')
+
+    inspection_abnormal_score = models.FloatField(default=0.0, verbose_name='巡检异常扣分')
+    open_incidents_score = models.FloatField(default=0.0, verbose_name='未处理事件扣分')
+    feeding_completion_score = models.FloatField(default=100.0, verbose_name='喂养完成得分')
+    cleaning_completion_score = models.FloatField(default=100.0, verbose_name='清洁完成得分')
+    capacity_ratio_score = models.FloatField(default=100.0, verbose_name='存栏容量得分')
+
+    inspection_abnormal_count = models.IntegerField(default=0, verbose_name='巡检异常数量')
+    open_incidents_count = models.IntegerField(default=0, verbose_name='未处理事件数量')
+    feeding_completion_rate = models.FloatField(default=0.0, verbose_name='喂养完成率(%)')
+    cleaning_completion_rate = models.FloatField(default=0.0, verbose_name='清洁完成率(%)')
+    capacity_ratio = models.FloatField(default=0.0, verbose_name='存栏容量占比(%)')
+
+    is_calculated = models.BooleanField(default=False, verbose_name='是否已计算')
+    calculated_at = models.DateTimeField(null=True, blank=True, verbose_name='计算时间')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        verbose_name = '栏区健康评分记录'
+        verbose_name_plural = verbose_name
+        ordering = ['-score_date', 'pen__code']
+        constraints = [
+            models.UniqueConstraint(fields=['score_date', 'pen'], name='unique_daily_pen_score'),
+        ]
+        indexes = [
+            models.Index(fields=['score_date', 'pen']),
+            models.Index(fields=['risk_level']),
+        ]
+
+    def __str__(self):
+        return f'{self.pen.code} - {self.score_date} ({self.total_score}分)'
+
+    def get_risk_level_display_cn(self):
+        return dict(HealthScoreRecord.RiskLevel.choices).get(self.risk_level, '未知')
+
+
+class HealthScoreDetail(models.Model):
+    """
+    健康评分明细 - 记录每一项扣分/加分的具体原因和关联记录
+    """
+    class ScoreType(models.TextChoices):
+        DEDUCTION = 'DEDUCTION', '扣分'
+        ADDITION = 'ADDITION', '加分'
+        RECOVERY = 'RECOVERY', '恢复加分'
+
+    class SourceType(models.TextChoices):
+        INSPECTION_ABNORMAL = 'inspection_abnormal', '巡检异常'
+        OPEN_INCIDENT = 'open_incident', '未处理异常事件'
+        INCIDENT_RESOLVED = 'incident_resolved', '异常事件解决'
+        FEEDING_INCOMPLETE = 'feeding_incomplete', '喂养未完成'
+        CLEANING_INCOMPLETE = 'cleaning_incomplete', '清洁未完成'
+        CAPACITY_ABNORMAL = 'capacity_abnormal', '存栏容量异常'
+        MANUAL_ADJUST = 'manual_adjust', '人工调整'
+
+    score_record = models.ForeignKey(HealthScoreRecord, on_delete=models.CASCADE, related_name='details', verbose_name='评分记录')
+    score_type = models.CharField(max_length=20, choices=ScoreType.choices, verbose_name='类型')
+    source_type = models.CharField(max_length=30, choices=SourceType.choices, verbose_name='来源类型')
+    score_value = models.FloatField(default=0.0, verbose_name='分值')
+    description = models.CharField(max_length=500, verbose_name='描述')
+    source_id = models.IntegerField(null=True, blank=True, verbose_name='关联源记录ID')
+    inspection_item = models.ForeignKey(InspectionItem, null=True, blank=True, on_delete=models.SET_NULL, related_name='score_details', verbose_name='关联巡检项')
+    incident = models.ForeignKey(Incident, null=True, blank=True, on_delete=models.SET_NULL, related_name='score_details', verbose_name='关联异常事件')
+    rectification_status = models.CharField(max_length=50, default='pending', verbose_name='整改状态')
+    rectified_at = models.DateTimeField(null=True, blank=True, verbose_name='整改时间')
+    operator = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name='score_details', verbose_name='操作人')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        verbose_name = '健康评分明细'
+        verbose_name_plural = verbose_name
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['score_record']),
+            models.Index(fields=['source_type']),
+            models.Index(fields=['rectification_status']),
+        ]
+
+    def __str__(self):
+        return f'{self.get_score_type_display()} {abs(self.score_value)}分 - {self.description}'

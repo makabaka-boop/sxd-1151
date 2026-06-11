@@ -217,6 +217,7 @@ class SnapshotService:
                 'livestock_type': pen.livestock_type,
                 'current_count': pen.current_count,
                 'capacity': pen.capacity,
+                'health_score': None,
                 'inspection': {
                     'total_items': total_inspection_items,
                     'completed_items': completed_item_count,
@@ -261,6 +262,23 @@ class SnapshotService:
                     len(abnormal_items)
                 )
             }
+            from .models import HealthScoreRecord
+            try:
+                score_record = HealthScoreRecord.objects.filter(
+                    score_date=target_date,
+                    pen_id=pen.id
+                ).first()
+                if score_record:
+                    pen_snapshot['health_score'] = {
+                        'total_score': score_record.total_score,
+                        'risk_level': score_record.risk_level,
+                        'risk_level_display': score_record.get_risk_level_display(),
+                        'deduction': score_record.deduction,
+                        'addition': score_record.addition,
+                    }
+            except Exception:
+                pass
+
             pen_snapshots.append(pen_snapshot)
 
         total_open_incidents = sum(s['incidents']['open_count'] for s in pen_snapshots)
@@ -270,6 +288,18 @@ class SnapshotService:
             2
         ) if pen_snapshots else 0.0
 
+        avg_health_score = 0.0
+        health_score_count = 0
+        risk_distribution = {}
+        for s in pen_snapshots:
+            if s['health_score'] and s['health_score']['total_score'] is not None:
+                avg_health_score += s['health_score']['total_score']
+                health_score_count += 1
+                risk_level = s['health_score']['risk_level_display']
+                risk_distribution[risk_level] = risk_distribution.get(risk_level, 0) + 1
+        if health_score_count > 0:
+            avg_health_score = round(avg_health_score / health_score_count, 2)
+
         return {
             'date': target_date.isoformat(),
             'total_pens': len(pen_snapshots),
@@ -277,6 +307,8 @@ class SnapshotService:
             'average_inspection_completion_rate': avg_completion_rate,
             'total_open_incidents': total_open_incidents,
             'total_abnormal_count': total_abnormal,
+            'average_health_score': avg_health_score,
+            'health_score_risk_distribution': risk_distribution,
             'pen_snapshots': pen_snapshots
         }
 
@@ -525,3 +557,546 @@ class SnapshotService:
 
 
 snapshot_service = SnapshotService()
+
+
+class HealthScoreService:
+    """健康评分计算服务"""
+
+    DEFAULT_DIMENSION_CONFIGS = [
+        {'dimension_key': 'inspection_abnormal', 'weight': 30, 'sort_order': 1},
+        {'dimension_key': 'open_incidents', 'weight': 25, 'sort_order': 2},
+        {'dimension_key': 'feeding_completion', 'weight': 15, 'sort_order': 3},
+        {'dimension_key': 'cleaning_completion', 'weight': 15, 'sort_order': 4},
+        {'dimension_key': 'capacity_ratio', 'weight': 15, 'sort_order': 5},
+    ]
+
+    DEFAULT_RISK_THRESHOLDS = [
+        {'risk_level': 'EXCELLENT', 'min_score': 90, 'max_score': 101, 'color': '#00C853', 'description': '状态优秀，一切正常'},
+        {'risk_level': 'GOOD', 'min_score': 75, 'max_score': 90, 'color': '#64DD17', 'description': '状态良好，需保持'},
+        {'risk_level': 'NORMAL', 'min_score': 60, 'max_score': 75, 'color': '#FFD600', 'description': '状态一般，需关注'},
+        {'risk_level': 'WARNING', 'min_score': 40, 'max_score': 60, 'color': '#FF9100', 'description': '存在风险，需整改'},
+        {'risk_level': 'DANGER', 'min_score': 0, 'max_score': 40, 'color': '#FF1744', 'description': '严重风险，需立即处理'},
+    ]
+
+    @classmethod
+    def initialize_default_configs(cls):
+        """初始化默认配置（如果不存在）"""
+        for config in cls.DEFAULT_DIMENSION_CONFIGS:
+            from .models import HealthScoreConfig
+            HealthScoreConfig.objects.get_or_create(
+                dimension_key=config['dimension_key'],
+                defaults={
+                    'weight': config['weight'],
+                    'sort_order': config['sort_order'],
+                    'is_enabled': True
+                }
+            )
+
+        for threshold in cls.DEFAULT_RISK_THRESHOLDS:
+            from .models import HealthScoreRiskThreshold
+            HealthScoreRiskThreshold.objects.get_or_create(
+                risk_level=threshold['risk_level'],
+                defaults={
+                    'min_score': threshold['min_score'],
+                    'max_score': threshold['max_score'],
+                    'color': threshold['color'],
+                    'description': threshold['description']
+                }
+            )
+
+    @classmethod
+    def _get_date_range(cls, target_date):
+        from datetime import datetime, timedelta
+        if isinstance(target_date, str):
+            target_date = datetime.strptime(target_date, '%Y-%m-%d').date()
+        start_dt = datetime.combine(target_date, datetime.min.time())
+        end_dt = start_dt + timedelta(days=1)
+        from django.utils import timezone
+        start_dt = timezone.make_aware(start_dt)
+        end_dt = timezone.make_aware(end_dt)
+        return target_date, start_dt, end_dt
+
+    @classmethod
+    def _get_active_pens(cls):
+        from .models import Pen
+        return Pen.objects.filter(is_active=True).order_by('code')
+
+    @classmethod
+    def _get_enabled_dimensions(cls):
+        from .models import HealthScoreConfig
+        return HealthScoreConfig.objects.filter(is_enabled=True)
+
+    @classmethod
+    def _get_risk_level(cls, score):
+        from .models import HealthScoreRiskThreshold
+        thresholds = HealthScoreRiskThreshold.objects.all().order_by('-min_score')
+        for threshold in thresholds:
+            if threshold.min_score <= score < threshold.max_score:
+                return threshold.risk_level
+        return 'NORMAL'
+
+    @classmethod
+    def calculate_pen_score(cls, pen, target_date):
+        """计算单个栏区在指定日期的健康评分"""
+        from .models import (
+            InspectionRecord, InspectionItemValue, FeedingRecord,
+            CleaningRecord, Incident, HealthScoreInspectionItem,
+            HealthScoreRecord, HealthScoreDetail
+        )
+
+        target_date, start_dt, end_dt = cls._get_date_range(target_date)
+        dimensions = cls._get_enabled_dimensions()
+        dim_map = {d.dimension_key: d for d in dimensions}
+
+        total_weight = sum(d.weight for d in dimensions)
+        if total_weight == 0:
+            total_weight = 100
+
+        base_score = 100.0
+        total_deduction = 0.0
+        total_addition = 0.0
+        dimension_scores = {}
+        dimension_counts = {}
+
+        score_details_data = []
+
+        # 1. 巡检异常扣分
+        if 'inspection_abnormal' in dim_map:
+            dim_weight = dim_map['inspection_abnormal'].weight
+            weighted_base = base_score * (dim_weight / total_weight)
+
+            abnormal_items = InspectionItemValue.objects.filter(
+                is_abnormal=True,
+                record__pen=pen,
+                record__inspection_time__gte=start_dt,
+                record__inspection_time__lt=end_dt
+            ).select_related('inspection_item', 'record')
+
+            abnormal_count = 0
+            inspection_deduction = 0.0
+
+            enabled_items = HealthScoreInspectionItem.objects.filter(
+                is_enabled=True
+            ).values_list('inspection_item_id', 'penalty_per_abnormal')
+            penalty_map = dict(enabled_items)
+
+            for item_value in abnormal_items:
+                abnormal_count += 1
+                penalty = penalty_map.get(item_value.inspection_item_id, 5.0)
+                actual_deduction = min(penalty * (dim_weight / 100), weighted_base / max(abnormal_count, 1))
+                inspection_deduction += actual_deduction
+
+                score_details_data.append({
+                    'score_type': 'DEDUCTION',
+                    'source_type': 'inspection_abnormal',
+                    'score_value': round(actual_deduction, 2),
+                    'description': f'巡检异常: {item_value.inspection_item.name} = {item_value.get_display_value()}',
+                    'source_id': item_value.record_id,
+                    'inspection_item': item_value.inspection_item,
+                    'incident': None,
+                    'rectification_status': 'pending',
+                })
+
+            dimension_scores['inspection_abnormal_score'] = round(max(0, weighted_base - inspection_deduction), 2)
+            dimension_counts['inspection_abnormal_count'] = abnormal_count
+            total_deduction += inspection_deduction
+
+        # 2. 未处理异常事件扣分
+        if 'open_incidents' in dim_map:
+            dim_weight = dim_map['open_incidents'].weight
+            weighted_base = base_score * (dim_weight / total_weight)
+
+            open_incidents = Incident.objects.filter(
+                pen=pen,
+                status__in=['OPEN', 'IN_PROGRESS']
+            ).filter(
+                incident_time__lt=end_dt
+            ).select_related('reporter', 'handler')
+
+            open_count = open_incidents.count()
+            incidents_deduction = 0.0
+            penalty_per_incident = 10.0 * (dim_weight / 100)
+
+            for incident in open_incidents:
+                severity_multiplier = {
+                    'LOW': 0.5,
+                    'MEDIUM': 1.0,
+                    'HIGH': 1.5,
+                    'CRITICAL': 2.0
+                }.get(incident.severity, 1.0)
+
+                deduction = min(penalty_per_incident * severity_multiplier, weighted_base / max(open_count, 1))
+                incidents_deduction += deduction
+
+                score_details_data.append({
+                    'score_type': 'DEDUCTION',
+                    'source_type': 'open_incident',
+                    'score_value': round(deduction, 2),
+                    'description': f'未处理事件[{incident.get_severity_display()}]: {incident.title}',
+                    'source_id': incident.id,
+                    'inspection_item': None,
+                    'incident': incident,
+                    'rectification_status': 'pending',
+                })
+
+            dimension_scores['open_incidents_score'] = round(max(0, weighted_base - incidents_deduction), 2)
+            dimension_counts['open_incidents_count'] = open_count
+            total_deduction += incidents_deduction
+
+        # 3. 喂养完成情况得分
+        if 'feeding_completion' in dim_map:
+            dim_weight = dim_map['feeding_completion'].weight
+            weighted_base = base_score * (dim_weight / total_weight)
+
+            feeding_records = FeedingRecord.objects.filter(
+                pen=pen,
+                feeding_time__gte=start_dt,
+                feeding_time__lt=end_dt
+            )
+            feeding_count = feeding_records.count()
+            expected_feeding = 2
+            feeding_rate = min(feeding_count / expected_feeding * 100, 100) if expected_feeding > 0 else 100
+            feeding_score = weighted_base * (feeding_rate / 100)
+
+            if feeding_rate < 100:
+                deduction = weighted_base - feeding_score
+                score_details_data.append({
+                    'score_type': 'DEDUCTION',
+                    'source_type': 'feeding_incomplete',
+                    'score_value': round(deduction, 2),
+                    'description': f'喂养未完成: {feeding_count}/{expected_feeding} 次',
+                    'source_id': None,
+                    'inspection_item': None,
+                    'incident': None,
+                    'rectification_status': 'pending',
+                })
+                total_deduction += deduction
+
+            dimension_scores['feeding_completion_score'] = round(feeding_score, 2)
+            dimension_counts['feeding_completion_rate'] = round(feeding_rate, 2)
+
+        # 4. 清洁完成情况得分
+        if 'cleaning_completion' in dim_map:
+            dim_weight = dim_map['cleaning_completion'].weight
+            weighted_base = base_score * (dim_weight / total_weight)
+
+            cleaning_records = CleaningRecord.objects.filter(
+                pen=pen,
+                cleaning_time__gte=start_dt,
+                cleaning_time__lt=end_dt
+            )
+            cleaning_count = cleaning_records.count()
+            expected_cleaning = 1
+            cleaning_rate = min(cleaning_count / expected_cleaning * 100, 100) if expected_cleaning > 0 else 100
+            cleaning_score = weighted_base * (cleaning_rate / 100)
+
+            if cleaning_rate < 100:
+                deduction = weighted_base - cleaning_score
+                score_details_data.append({
+                    'score_type': 'DEDUCTION',
+                    'source_type': 'cleaning_incomplete',
+                    'score_value': round(deduction, 2),
+                    'description': f'清洁未完成: {cleaning_count}/{expected_cleaning} 次',
+                    'source_id': None,
+                    'inspection_item': None,
+                    'incident': None,
+                    'rectification_status': 'pending',
+                })
+                total_deduction += deduction
+
+            dimension_scores['cleaning_completion_score'] = round(cleaning_score, 2)
+            dimension_counts['cleaning_completion_rate'] = round(cleaning_rate, 2)
+
+        # 5. 存栏容量占比得分
+        if 'capacity_ratio' in dim_map:
+            dim_weight = dim_map['capacity_ratio'].weight
+            weighted_base = base_score * (dim_weight / total_weight)
+
+            capacity_ratio = 0
+            if pen.capacity > 0:
+                capacity_ratio = (pen.current_count / pen.capacity) * 100
+
+            optimal_min = 60
+            optimal_max = 90
+            if optimal_min <= capacity_ratio <= optimal_max:
+                capacity_score = weighted_base
+            else:
+                deviation = max(optimal_min - capacity_ratio, capacity_ratio - optimal_max, 0)
+                penalty_ratio = min(deviation / 50, 1.0)
+                capacity_score = weighted_base * (1 - penalty_ratio * 0.5)
+
+                if penalty_ratio > 0:
+                    deduction = weighted_base - capacity_score
+                    status = '存栏不足' if capacity_ratio < optimal_min else '存栏过载'
+                    score_details_data.append({
+                        'score_type': 'DEDUCTION',
+                        'source_type': 'capacity_abnormal',
+                        'score_value': round(deduction, 2),
+                        'description': f'{status}: 当前{pen.current_count}/容量{pen.capacity} ({round(capacity_ratio, 1)}%)',
+                        'source_id': None,
+                        'inspection_item': None,
+                        'incident': None,
+                        'rectification_status': 'pending',
+                    })
+                    total_deduction += deduction
+
+            dimension_scores['capacity_ratio_score'] = round(capacity_score, 2)
+            dimension_counts['capacity_ratio'] = round(capacity_ratio, 2)
+
+        # 检查当日已解决的异常事件，添加恢复加分
+        resolved_incidents = Incident.objects.filter(
+            pen=pen,
+            status__in=['RESOLVED', 'CLOSED'],
+            resolved_time__gte=start_dt,
+            resolved_time__lt=end_dt
+        ).select_related('reporter', 'handler')
+
+        for incident in resolved_incidents:
+            recovery_score = min(3.0, 5.0)
+            total_addition += recovery_score
+            score_details_data.append({
+                'score_type': 'RECOVERY',
+                'source_type': 'incident_resolved',
+                'score_value': round(recovery_score, 2),
+                'description': f'异常事件已解决: {incident.title}',
+                'source_id': incident.id,
+                'inspection_item': None,
+                'incident': incident,
+                'rectification_status': 'rectified',
+            })
+
+        total_score = round(max(0, min(100, base_score - total_deduction + total_addition)), 2)
+        risk_level = cls._get_risk_level(total_score)
+
+        return {
+            'pen': pen,
+            'score_date': target_date,
+            'base_score': round(base_score, 2),
+            'total_score': total_score,
+            'deduction': round(total_deduction, 2),
+            'addition': round(total_addition, 2),
+            'risk_level': risk_level,
+            'dimension_scores': dimension_scores,
+            'dimension_counts': dimension_counts,
+            'details': score_details_data,
+        }
+
+    @classmethod
+    def save_score_record(cls, score_data):
+        """保存评分记录和明细"""
+        from .models import HealthScoreRecord, HealthScoreDetail
+        from django.utils import timezone
+
+        record, created = HealthScoreRecord.objects.update_or_create(
+            score_date=score_data['score_date'],
+            pen=score_data['pen'],
+            defaults={
+                'base_score': score_data['base_score'],
+                'total_score': score_data['total_score'],
+                'deduction': score_data['deduction'],
+                'addition': score_data['addition'],
+                'risk_level': score_data['risk_level'],
+                'inspection_abnormal_score': score_data['dimension_scores'].get('inspection_abnormal_score', 0),
+                'open_incidents_score': score_data['dimension_scores'].get('open_incidents_score', 0),
+                'feeding_completion_score': score_data['dimension_scores'].get('feeding_completion_score', 100),
+                'cleaning_completion_score': score_data['dimension_scores'].get('cleaning_completion_score', 100),
+                'capacity_ratio_score': score_data['dimension_scores'].get('capacity_ratio_score', 100),
+                'inspection_abnormal_count': score_data['dimension_counts'].get('inspection_abnormal_count', 0),
+                'open_incidents_count': score_data['dimension_counts'].get('open_incidents_count', 0),
+                'feeding_completion_rate': score_data['dimension_counts'].get('feeding_completion_rate', 0),
+                'cleaning_completion_rate': score_data['dimension_counts'].get('cleaning_completion_rate', 0),
+                'capacity_ratio': score_data['dimension_counts'].get('capacity_ratio', 0),
+                'is_calculated': True,
+                'calculated_at': timezone.now(),
+            }
+        )
+
+        if not created:
+            record.details.all().delete()
+
+        details_to_create = []
+        for detail_data in score_data['details']:
+            details_to_create.append(HealthScoreDetail(
+                score_record=record,
+                score_type=detail_data['score_type'],
+                source_type=detail_data['source_type'],
+                score_value=detail_data['score_value'],
+                description=detail_data['description'],
+                source_id=detail_data['source_id'],
+                inspection_item=detail_data['inspection_item'],
+                incident=detail_data['incident'],
+                rectification_status=detail_data['rectification_status'],
+                rectified_at=timezone.now() if detail_data['rectification_status'] == 'rectified' else None,
+            ))
+
+        if details_to_create:
+            HealthScoreDetail.objects.bulk_create(details_to_create)
+
+        return record
+
+    @classmethod
+    def calculate_and_save_daily_scores(cls, target_date, pen_id=None):
+        """计算并保存指定日期所有栏区的健康评分"""
+        cls.initialize_default_configs()
+        pens = cls._get_active_pens()
+        if pen_id:
+            pens = pens.filter(id=pen_id)
+
+        results = []
+        for pen in pens:
+            score_data = cls.calculate_pen_score(pen, target_date)
+            record = cls.save_score_record(score_data)
+            results.append(record)
+
+        return results
+
+    @classmethod
+    def recalculate_on_data_change(cls, pen_id, event_date=None):
+        """当巡检/喂养/清洁/异常事件数据变更时重新计算评分"""
+        from django.utils import timezone
+        if event_date is None:
+            event_date = timezone.now().date()
+        return cls.calculate_and_save_daily_scores(event_date, pen_id)
+
+    @classmethod
+    def get_score_trend(cls, start_date, end_date, pen_id=None):
+        """获取评分趋势数据"""
+        from datetime import timedelta
+        from .models import HealthScoreRecord
+
+        if isinstance(start_date, str):
+            from datetime import datetime
+            start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+        if isinstance(end_date, str):
+            from datetime import datetime
+            end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+
+        pens = cls._get_active_pens()
+        if pen_id:
+            pens = pens.filter(id=pen_id)
+
+        pen_ids = list(pens.values_list('id', flat=True))
+
+        records = HealthScoreRecord.objects.filter(
+            score_date__gte=start_date,
+            score_date__lte=end_date,
+            pen_id__in=pen_ids
+        ).select_related('pen').order_by('score_date', 'pen__code')
+
+        from collections import defaultdict
+        daily_summary = defaultdict(list)
+        for record in records:
+            daily_summary[record.score_date].append(record)
+
+        trend_data = []
+        current_date = start_date
+        while current_date <= end_date:
+            day_records = daily_summary.get(current_date, [])
+            if day_records:
+                avg_score = round(sum(r.total_score for r in day_records) / len(day_records), 2)
+                total_deduction = round(sum(r.deduction for r in day_records), 2)
+                total_addition = round(sum(r.addition for r in day_records), 2)
+                by_risk = defaultdict(int)
+                for r in day_records:
+                    by_risk[r.risk_level] += 1
+            else:
+                avg_score = 0
+                total_deduction = 0
+                total_addition = 0
+                by_risk = {}
+
+            pen_scores = []
+            for r in day_records:
+                pen_scores.append({
+                    'pen_id': r.pen_id,
+                    'pen_code': r.pen.code,
+                    'pen_name': r.pen.name,
+                    'score': r.total_score,
+                    'risk_level': r.risk_level,
+                    'risk_level_display': r.get_risk_level_display(),
+                    'deduction': r.deduction,
+                    'addition': r.addition,
+                })
+
+            trend_data.append({
+                'date': current_date.isoformat(),
+                'average_score': avg_score,
+                'total_deduction': total_deduction,
+                'total_addition': total_addition,
+                'pen_count': len(day_records),
+                'risk_distribution': dict(by_risk),
+                'pen_scores': pen_scores,
+            })
+            current_date += timedelta(days=1)
+
+        return {
+            'start_date': start_date.isoformat(),
+            'end_date': end_date.isoformat(),
+            'trend_data': trend_data,
+        }
+
+    @classmethod
+    def get_dashboard_summary(cls, target_date=None):
+        """获取仪表板评分汇总"""
+        from django.utils import timezone
+        from .models import HealthScoreRecord
+
+        if target_date is None:
+            target_date = timezone.now().date()
+
+        pens = cls._get_active_pens()
+        pen_ids = list(pens.values_list('id', flat=True))
+
+        records = HealthScoreRecord.objects.filter(
+            score_date=target_date,
+            pen_id__in=pen_ids
+        ).select_related('pen')
+
+        if not records.exists():
+            cls.calculate_and_save_daily_scores(target_date)
+            records = HealthScoreRecord.objects.filter(
+                score_date=target_date,
+                pen_id__in=pen_ids
+            ).select_related('pen')
+
+        total_pens = records.count()
+        if total_pens == 0:
+            return {
+                'date': target_date.isoformat(),
+                'total_pens': 0,
+                'average_score': 0,
+                'risk_distribution': {},
+                'top_issues': [],
+            }
+
+        avg_score = round(sum(r.total_score for r in records) / total_pens, 2)
+
+        from collections import defaultdict
+        by_risk = defaultdict(int)
+        for r in records:
+            by_risk[r.get_risk_level_display()] += 1
+
+        low_score_pens = records.order_by('total_score')[:5]
+        top_issues = []
+        for r in low_score_pens:
+            top_issues.append({
+                'pen_id': r.pen_id,
+                'pen_code': r.pen.code,
+                'pen_name': r.pen.name,
+                'score': r.total_score,
+                'risk_level': r.risk_level,
+                'risk_level_display': r.get_risk_level_display(),
+                'deduction': r.deduction,
+                'abnormal_count': r.inspection_abnormal_count + r.open_incidents_count,
+            })
+
+        return {
+            'date': target_date.isoformat(),
+            'total_pens': total_pens,
+            'average_score': avg_score,
+            'risk_distribution': dict(by_risk),
+            'top_issues': top_issues,
+        }
+
+
+health_score_service = HealthScoreService()

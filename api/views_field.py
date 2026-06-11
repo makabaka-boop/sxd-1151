@@ -20,6 +20,7 @@ from .serializers import (
     IncidentSerializer, IncidentCreateSerializer, IncidentStatusUpdateSerializer
 )
 from .permissions import CanSubmitRecords, IsAdminOrFieldWorker
+from .services import health_score_service
 
 
 class InspectionRecordViewSet(viewsets.ModelViewSet):
@@ -63,6 +64,10 @@ class InspectionRecordViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
         self.perform_create(serializer)
+        pen_id = serializer.validated_data.get('pen_id')
+        inspection_time = serializer.validated_data.get('inspection_time')
+        if pen_id and inspection_time:
+            health_score_service.recalculate_on_data_change(pen_id, inspection_time.date())
         headers = self.get_success_headers(serializer.data)
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
@@ -130,6 +135,10 @@ class FeedingRecordViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
         self.perform_create(serializer)
+        pen_id = serializer.validated_data.get('pen_id')
+        feeding_time = serializer.validated_data.get('feeding_time')
+        if pen_id and feeding_time:
+            health_score_service.recalculate_on_data_change(pen_id, feeding_time.date())
         headers = self.get_success_headers(serializer.data)
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
@@ -205,6 +214,10 @@ class CleaningRecordViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
         self.perform_create(serializer)
+        pen_id = serializer.validated_data.get('pen_id')
+        cleaning_time = serializer.validated_data.get('cleaning_time')
+        if pen_id and cleaning_time:
+            health_score_service.recalculate_on_data_change(pen_id, cleaning_time.date())
         headers = self.get_success_headers(serializer.data)
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
@@ -259,6 +272,10 @@ class IncidentViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
         self.perform_create(serializer)
+        pen_id = serializer.validated_data.get('pen_id')
+        incident_time = serializer.validated_data.get('incident_time')
+        if pen_id and incident_time:
+            health_score_service.recalculate_on_data_change(pen_id, incident_time.date())
         headers = self.get_success_headers(serializer.data)
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
@@ -266,9 +283,12 @@ class IncidentViewSet(viewsets.ModelViewSet):
         """更新事件状态（处理事件）"""
         partial = kwargs.pop('partial', False)
         instance = self.get_object()
+        pen_id = instance.pen_id
         serializer = self.get_serializer(instance, data=request.data, partial=partial, context={'request': request})
         serializer.is_valid(raise_exception=True)
         self.perform_update(serializer)
+        from django.utils import timezone
+        health_score_service.recalculate_on_data_change(pen_id, timezone.now().date())
         return Response(serializer.data)
 
     @action(detail=False, methods=['get'])

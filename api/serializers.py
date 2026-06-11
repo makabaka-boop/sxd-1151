@@ -6,7 +6,9 @@ from django.contrib.auth import get_user_model
 from django.utils import timezone
 from .models import (
     Pen, InspectionItem, InspectionRecord, InspectionItemValue,
-    FeedingRecord, CleaningRecord, Incident, IncidentUpdate
+    FeedingRecord, CleaningRecord, Incident, IncidentUpdate,
+    HealthScoreConfig, HealthScoreInspectionItem, HealthScoreRiskThreshold,
+    HealthScoreRecord, HealthScoreDetail
 )
 
 User = get_user_model()
@@ -38,14 +40,30 @@ class UserCreateSerializer(serializers.ModelSerializer):
 
 class PenSerializer(serializers.ModelSerializer):
     livestock_type_display = serializers.CharField(source='get_livestock_type_display', read_only=True)
+    today_health_score = serializers.SerializerMethodField()
 
     class Meta:
         model = Pen
         fields = [
             'id', 'code', 'name', 'location', 'livestock_type', 'livestock_type_display',
-            'capacity', 'current_count', 'description', 'is_active', 'created_at', 'updated_at'
+            'capacity', 'current_count', 'description', 'is_active', 'created_at', 'updated_at',
+            'today_health_score'
         ]
-        read_only_fields = ['created_at', 'updated_at']
+        read_only_fields = ['created_at', 'updated_at', 'today_health_score']
+
+    def get_today_health_score(self, obj):
+        from django.utils import timezone
+        today = timezone.now().date()
+        score = obj.health_scores.filter(score_date=today).first()
+        if score:
+            return {
+                'total_score': score.total_score,
+                'risk_level': score.risk_level,
+                'risk_level_display': score.get_risk_level_display(),
+                'deduction': score.deduction,
+                'addition': score.addition,
+            }
+        return None
 
 
 class InspectionItemSerializer(serializers.ModelSerializer):
@@ -290,3 +308,113 @@ class IncidentStatusUpdateSerializer(serializers.ModelSerializer):
             )
 
         return instance
+
+
+class HealthScoreConfigSerializer(serializers.ModelSerializer):
+    dimension_key_display = serializers.CharField(source='get_dimension_key_display', read_only=True)
+
+    class Meta:
+        model = HealthScoreConfig
+        fields = [
+            'id', 'dimension_key', 'dimension_key_display', 'weight',
+            'is_enabled', 'sort_order', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['created_at', 'updated_at']
+
+
+class HealthScoreInspectionItemSerializer(serializers.ModelSerializer):
+    inspection_item_code = serializers.CharField(source='inspection_item.code', read_only=True)
+    inspection_item_name = serializers.CharField(source='inspection_item.name', read_only=True)
+
+    class Meta:
+        model = HealthScoreInspectionItem
+        fields = [
+            'id', 'inspection_item_id', 'inspection_item_code', 'inspection_item_name',
+            'penalty_per_abnormal', 'is_enabled', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['created_at', 'updated_at']
+
+
+class HealthScoreRiskThresholdSerializer(serializers.ModelSerializer):
+    risk_level_display = serializers.CharField(source='get_risk_level_display', read_only=True)
+
+    class Meta:
+        model = HealthScoreRiskThreshold
+        fields = [
+            'id', 'risk_level', 'risk_level_display', 'min_score', 'max_score',
+            'color', 'description', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['created_at', 'updated_at']
+
+
+class HealthScoreDetailSerializer(serializers.ModelSerializer):
+    score_type_display = serializers.CharField(source='get_score_type_display', read_only=True)
+    source_type_display = serializers.CharField(source='get_source_type_display', read_only=True)
+    inspection_item_code = serializers.CharField(source='inspection_item.code', read_only=True, allow_null=True)
+    inspection_item_name = serializers.CharField(source='inspection_item.name', read_only=True, allow_null=True)
+    incident_title = serializers.CharField(source='incident.title', read_only=True, allow_null=True)
+    operator_name = serializers.CharField(source='operator.real_name', read_only=True, allow_null=True)
+
+    class Meta:
+        model = HealthScoreDetail
+        fields = [
+            'id', 'score_type', 'score_type_display', 'source_type', 'source_type_display',
+            'score_value', 'description', 'source_id',
+            'inspection_item_id', 'inspection_item_code', 'inspection_item_name',
+            'incident_id', 'incident_title',
+            'rectification_status', 'rectified_at',
+            'operator_id', 'operator_name',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['created_at', 'updated_at']
+
+
+class HealthScoreRecordSerializer(serializers.ModelSerializer):
+    pen_code = serializers.CharField(source='pen.code', read_only=True)
+    pen_name = serializers.CharField(source='pen.name', read_only=True)
+    risk_level_display = serializers.CharField(source='get_risk_level_display', read_only=True)
+    details = HealthScoreDetailSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = HealthScoreRecord
+        fields = [
+            'id', 'score_date', 'pen_id', 'pen_code', 'pen_name',
+            'total_score', 'base_score', 'deduction', 'addition',
+            'risk_level', 'risk_level_display',
+            'inspection_abnormal_score', 'open_incidents_score',
+            'feeding_completion_score', 'cleaning_completion_score', 'capacity_ratio_score',
+            'inspection_abnormal_count', 'open_incidents_count',
+            'feeding_completion_rate', 'cleaning_completion_rate', 'capacity_ratio',
+            'is_calculated', 'calculated_at', 'created_at', 'updated_at',
+            'details'
+        ]
+        read_only_fields = [
+            'created_at', 'updated_at', 'is_calculated', 'calculated_at',
+            'total_score', 'base_score', 'deduction', 'addition', 'risk_level',
+            'inspection_abnormal_score', 'open_incidents_score',
+            'feeding_completion_score', 'cleaning_completion_score', 'capacity_ratio_score',
+            'inspection_abnormal_count', 'open_incidents_count',
+            'feeding_completion_rate', 'cleaning_completion_rate', 'capacity_ratio'
+        ]
+
+
+class HealthScoreRecordListSerializer(serializers.ModelSerializer):
+    pen_code = serializers.CharField(source='pen.code', read_only=True)
+    pen_name = serializers.CharField(source='pen.name', read_only=True)
+    risk_level_display = serializers.CharField(source='get_risk_level_display', read_only=True)
+
+    class Meta:
+        model = HealthScoreRecord
+        fields = [
+            'id', 'score_date', 'pen_id', 'pen_code', 'pen_name',
+            'total_score', 'deduction', 'addition',
+            'risk_level', 'risk_level_display',
+            'inspection_abnormal_count', 'open_incidents_count',
+            'feeding_completion_rate', 'cleaning_completion_rate', 'capacity_ratio',
+            'is_calculated', 'calculated_at'
+        ]
+
+
+class HealthScoreManualAdjustSerializer(serializers.Serializer):
+    score_value = serializers.FloatField(help_text='调整分值，正数加分，负数扣分')
+    description = serializers.CharField(max_length=500, help_text='调整原因')

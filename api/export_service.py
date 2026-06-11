@@ -62,11 +62,16 @@ class ExportService:
         ws['A1'].alignment = center_align
         ws.row_dimensions[1].height = 30
 
+        avg_health_score = snapshot.get('average_health_score', 0)
+        risk_distribution = snapshot.get('health_score_risk_distribution', {})
+        risk_text = ', '.join([f'{k}:{v}' for k, v in risk_distribution.items()]) or '无数据'
+
         summary_data = [
-            ['汇总信息', '', '', '', '', '', '', '', '', '', '', ''],
+            ['汇总信息', '', '', '', '', '', '', '', '', '', '', '', '', '', ''],
             ['栏区总数', snapshot['total_pens'], '平均巡检完成率', f'{snapshot["average_inspection_completion_rate"]}%',
              '待处理异常事件', snapshot['total_open_incidents'], '今日异常总数', snapshot['total_abnormal_count'],
-             '导出时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S'), '', ''],
+             '平均健康评分', avg_health_score, '风险分布', risk_text,
+             '导出时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S'), ''],
         ]
 
         row = 3
@@ -88,7 +93,7 @@ class ExportService:
             '巡检完成率', '巡检次数', '异常指标数',
             '喂养次数', '总投喂量(kg)',
             '清洁次数', '总耗时(分钟)',
-            '待处理事件', '今日新事件', '整体状态'
+            '待处理事件', '今日新事件', '健康评分', '风险等级', '整体状态'
         ]
 
         for col, header in enumerate(detail_headers, 1):
@@ -102,6 +107,13 @@ class ExportService:
         for pen_snap in snapshot['pen_snapshots']:
             status_color = cls.STATUS_COLORS.get(pen_snap['overall_status'], '#FFFFFF')
             status_name = cls.STATUS_NAMES.get(pen_snap['overall_status'], '未知')
+            health_score = pen_snap.get('health_score') or {}
+            hs_score = health_score.get('total_score', '-')
+            hs_risk = health_score.get('risk_level_display', '-')
+            hs_color = health_score.get('risk_level') and {
+                'EXCELLENT': '#00C853', 'GOOD': '#64DD17', 'NORMAL': '#FFD600',
+                'WARNING': '#FF9100', 'DANGER': '#FF1744'
+            }.get(health_score.get('risk_level'), '#FFFFFF') or '#FFFFFF'
 
             row_data = [
                 pen_snap['pen_code'],
@@ -117,6 +129,8 @@ class ExportService:
                 pen_snap['cleaning']['total_duration_minutes'],
                 pen_snap['incidents']['open_count'],
                 pen_snap['incidents']['new_today_count'],
+                hs_score,
+                hs_risk,
                 status_name,
             ]
 
@@ -124,7 +138,9 @@ class ExportService:
                 cell = ws.cell(row=row, column=col, value=value)
                 cell.alignment = center_align if col != 2 else left_align
                 cell.border = thin_border
-                if col == 14:
+                if col == 15:
+                    cell.fill = PatternFill(start_color=hs_color.lstrip('#'), end_color=hs_color.lstrip('#'), fill_type='solid')
+                if col == 16:
                     excel_color = status_color.lstrip('#')
                     cell.fill = PatternFill(start_color=excel_color, end_color=excel_color, fill_type='solid')
             row += 1
@@ -168,7 +184,7 @@ class ExportService:
                     cell.border = thin_border
                 row += 1
 
-        column_widths = [12, 20, 10, 10, 12, 10, 12, 10, 14, 10, 14, 12, 12, 10]
+        column_widths = [12, 20, 10, 10, 12, 10, 12, 10, 14, 10, 14, 12, 12, 10, 10, 10]
         for col, width in enumerate(column_widths, 1):
             ws.column_dimensions[get_column_letter(col)].width = width
 
@@ -220,12 +236,14 @@ class ExportService:
         story.append(Paragraph(f'养殖场巡检日报 - {target_date}', title_style))
         story.append(Spacer(1, 0.5 * cm))
 
+        avg_health_score = snapshot.get('average_health_score', 0)
         summary_data = [
             ['栏区总数', str(snapshot['total_pens']),
              '平均巡检完成率', f'{snapshot["average_inspection_completion_rate"]}%',
-             '待处理异常事件', str(snapshot['total_open_incidents']),
+             '平均健康评分', str(avg_health_score),
+             '待处理异常', str(snapshot['total_open_incidents']),
              '今日异常总数', str(snapshot['total_abnormal_count'])],
-            ['导出时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S'), '', '', '', '', '', ''],
+            ['导出时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S'), '', '', '', '', '', '', '', ''],
         ]
 
         summary_table = Table(summary_data, colWidths=[2.5 * cm, 2 * cm, 3.5 * cm, 2 * cm, 3 * cm, 2 * cm, 3 * cm, 2 * cm])
@@ -247,12 +265,15 @@ class ExportService:
             '巡检完成率', '巡检次数', '异常指标',
             '喂养次数', '投喂量(kg)',
             '清洁次数', '耗时(分)',
-            '待处理', '新事件', '状态'
+            '待处理', '新事件', '评分', '风险', '状态'
         ]
 
         detail_data = [detail_headers]
         for pen_snap in snapshot['pen_snapshots']:
             status_name = cls.STATUS_NAMES.get(pen_snap['overall_status'], '未知')
+            health_score = pen_snap.get('health_score') or {}
+            hs_score = str(health_score.get('total_score', '-'))
+            hs_risk = str(health_score.get('risk_level_display', '-'))
             detail_data.append([
                 pen_snap['pen_code'],
                 pen_snap['pen_name'],
@@ -267,10 +288,12 @@ class ExportService:
                 str(pen_snap['cleaning']['total_duration_minutes']),
                 str(pen_snap['incidents']['open_count']),
                 str(pen_snap['incidents']['new_today_count']),
+                hs_score,
+                hs_risk,
                 status_name,
             ])
 
-        detail_table = Table(detail_data, colWidths=[1.6 * cm] * 14)
+        detail_table = Table(detail_data, colWidths=[1.5 * cm] * 16)
         style_cmds = [
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#4472C4')),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
@@ -284,7 +307,15 @@ class ExportService:
         for i, pen_snap in enumerate(snapshot['pen_snapshots'], 1):
             status = pen_snap['overall_status']
             color = cls.STATUS_COLORS.get(status, '#FFFFFF')
-            style_cmds.append(('BACKGROUND', (13, i), (13, i), colors.HexColor(color)))
+            style_cmds.append(('BACKGROUND', (15, i), (15, i), colors.HexColor(color)))
+            health_score = pen_snap.get('health_score') or {}
+            risk_level = health_score.get('risk_level')
+            if risk_level:
+                hs_color = {
+                    'EXCELLENT': '#00C853', 'GOOD': '#64DD17', 'NORMAL': '#FFD600',
+                    'WARNING': '#FF9100', 'DANGER': '#FF1744'
+                }.get(risk_level, '#FFFFFF')
+                style_cmds.append(('BACKGROUND', (14, i), (14, i), colors.HexColor(hs_color)))
 
         detail_table.setStyle(TableStyle(style_cmds))
         story.append(detail_table)

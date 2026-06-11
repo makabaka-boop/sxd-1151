@@ -10,10 +10,16 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 from django.utils import timezone
 from datetime import datetime, timedelta, date
-from .models import Pen
-from .serializers import PenSerializer
-from .permissions import CanViewReports, CanExportReports
-from .services import snapshot_service
+from .models import (
+    Pen, HealthScoreRecord, HealthScoreDetail
+)
+from .serializers import (
+    PenSerializer, HealthScoreRecordSerializer,
+    HealthScoreRecordListSerializer, HealthScoreDetailSerializer,
+    HealthScoreManualAdjustSerializer
+)
+from .permissions import CanViewReports, CanExportReports, IsAdmin
+from .services import snapshot_service, health_score_service
 from .export_service import export_service
 
 
@@ -440,6 +446,9 @@ class DashboardView(APIView):
         week_start = today - timedelta(days=6)
         week_trend = snapshot_service.get_trend_data(week_start, today, None, 'completion_rate')
 
+        health_score_summary = health_score_service.get_dashboard_summary(today)
+        health_score_trend = health_score_service.get_score_trend(week_start, today)
+
         from .models import Incident
         open_incidents = Incident.objects.filter(status__in=['OPEN', 'IN_PROGRESS']).count()
         high_priority = Incident.objects.filter(
@@ -454,4 +463,460 @@ class DashboardView(APIView):
             'weekly_trend': week_trend,
             'open_incidents': open_incidents,
             'high_priority_incidents': high_priority,
+            'health_score_summary': health_score_summary,
+            'health_score_trend': health_score_trend,
         })
+
+
+class HealthScoreViewSet(viewsets.GenericViewSet):
+    """健康评分查看接口 - 观察员可查看筛选，管理员可手动调整"""
+    permission_classes = [IsAuthenticated, CanViewReports]
+    queryset = HealthScoreRecord.objects.none()
+
+    def get_queryset(self):
+        return HealthScoreRecord.objects.all().select_related('pen').order_by('-score_date', 'pen__code')
+
+    def list(self, request, *args, **kwargs):
+        """
+        获取健康评分记录列表
+        参数:
+            date: 指定日期 (YYYY-MM-DD)
+            date_from: 开始日期
+            date_to: 结束日期
+            pen_id: 栏区ID
+            risk_level: 风险等级 (EXCELLENT/GOOD/NORMAL/WARNING/DANGER)
+        """
+        queryset = self.get_queryset()
+
+        target_date = request.query_params.get('date')
+        date_from = request.query_params.get('date_from')
+        date_to = request.query_params.get('date_to')
+        pen_id = request.query_params.get('pen_id')
+        risk_level = request.query_params.get('risk_level')
+
+        if target_date:
+            try:
+                date_obj = datetime.strptime(target_date, '%Y-%m-%d').date()
+                queryset = queryset.filter(score_date=date_obj)
+            except ValueError:
+                return Response(
+                    {'error': '日期格式错误，请使用 YYYY-MM-DD 格式'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        if date_from:
+            try:
+                date_obj = datetime.strptime(date_from, '%Y-%m-%d').date()
+                queryset = queryset.filter(score_date__gte=date_obj)
+            except ValueError:
+                return Response(
+                    {'error': '日期格式错误'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        if date_to:
+            try:
+                date_obj = datetime.strptime(date_to, '%Y-%m-%d').date()
+                queryset = queryset.filter(score_date__lte=date_obj)
+            except ValueError:
+                return Response(
+                    {'error': '日期格式错误'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        if pen_id:
+            try:
+                queryset = queryset.filter(pen_id=int(pen_id))
+            except (ValueError, TypeError):
+                return Response(
+                    {'error': 'pen_id 必须是整数'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        if risk_level:
+            queryset = queryset.filter(risk_level=risk_level)
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = HealthScoreRecordListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = HealthScoreRecordListSerializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'])
+    def today(self, request):
+        """获取今日所有栏区的健康评分"""
+        today = timezone.now().date()
+        pen_id = request.query_params.get('pen_id')
+
+        records = HealthScoreRecord.objects.filter(
+            score_date=today
+        ).select_related('pen').order_by('pen__code')
+
+        if pen_id:
+            try:
+                records = records.filter(pen_id=int(pen_id))
+            except (ValueError, TypeError):
+                return Response(
+                    {'error': 'pen_id 必须是整数'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        if not records.exists():
+            health_score_service.calculate_and_save_daily_scores(today, pen_id)
+            records = HealthScoreRecord.objects.filter(
+                score_date=today
+            ).select_related('pen').order_by('pen__code')
+            if pen_id:
+                records = records.filter(pen_id=int(pen_id))
+
+        serializer = HealthScoreRecordListSerializer(records, many=True)
+        return Response({
+            'date': today.isoformat(),
+            'records': serializer.data
+        })
+
+    @action(detail=False, methods=['get'])
+    def daily(self, request):
+        """
+        获取指定日期的健康评分
+        参数:
+            date: 日期 (YYYY-MM-DD)，默认今日
+            pen_id: 栏区ID，可选
+        """
+        target_date = request.query_params.get('date', timezone.now().date().isoformat())
+        pen_id = request.query_params.get('pen_id')
+
+        try:
+            date_obj = datetime.strptime(target_date, '%Y-%m-%d').date()
+        except ValueError:
+            return Response(
+                {'error': '日期格式错误，请使用 YYYY-MM-DD 格式'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        records = HealthScoreRecord.objects.filter(
+            score_date=date_obj
+        ).select_related('pen').order_by('pen__code')
+
+        if pen_id:
+            try:
+                records = records.filter(pen_id=int(pen_id))
+            except (ValueError, TypeError):
+                return Response(
+                    {'error': 'pen_id 必须是整数'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        if not records.exists():
+            health_score_service.calculate_and_save_daily_scores(date_obj, pen_id)
+            records = HealthScoreRecord.objects.filter(
+                score_date=date_obj
+            ).select_related('pen').order_by('pen__code')
+            if pen_id:
+                records = records.filter(pen_id=int(pen_id))
+
+        serializer = HealthScoreRecordSerializer(records, many=True)
+        return Response({
+            'date': date_obj.isoformat(),
+            'records': serializer.data
+        })
+
+    @action(detail=True, methods=['get'])
+    def details(self, request, pk=None):
+        """获取单条评分记录的完整详情（含扣分明细）"""
+        try:
+            record = HealthScoreRecord.objects.select_related('pen').prefetch_related(
+                'details__inspection_item', 'details__incident', 'details__operator'
+            ).get(id=pk)
+        except HealthScoreRecord.DoesNotExist:
+            return Response(
+                {'error': '评分记录不存在'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        serializer = HealthScoreRecordSerializer(record)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'])
+    def trend(self, request):
+        """
+        获取健康评分趋势数据
+        参数:
+            start_date: 开始日期 (YYYY-MM-DD)
+            end_date: 结束日期 (YYYY-MM-DD)，默认今日
+            pen_id: 栏区ID，可选
+        """
+        end_date = request.query_params.get('end_date', timezone.now().date().isoformat())
+        start_date = request.query_params.get('start_date')
+        pen_id = request.query_params.get('pen_id')
+
+        if not start_date:
+            return Response(
+                {'error': '必须提供 start_date 参数'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            start_date_obj = datetime.strptime(start_date, '%Y-%m-%d').date()
+            end_date_obj = datetime.strptime(end_date, '%Y-%m-%d').date()
+        except ValueError:
+            return Response(
+                {'error': '日期格式错误，请使用 YYYY-MM-DD 格式'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if start_date_obj > end_date_obj:
+            return Response(
+                {'error': 'start_date 不能晚于 end_date'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if pen_id:
+            try:
+                pen_id = int(pen_id)
+            except (ValueError, TypeError):
+                return Response(
+                    {'error': 'pen_id 必须是整数'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        trend_data = health_score_service.get_score_trend(start_date_obj, end_date_obj, pen_id)
+        return Response(trend_data)
+
+    @action(detail=False, methods=['get'])
+    def weekly_trend(self, request):
+        """获取过去7天的评分趋势"""
+        end_date = timezone.now().date()
+        start_date = end_date - timedelta(days=6)
+        pen_id = request.query_params.get('pen_id')
+
+        if pen_id:
+            try:
+                pen_id = int(pen_id)
+            except (ValueError, TypeError):
+                return Response(
+                    {'error': 'pen_id 必须是整数'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        trend_data = health_score_service.get_score_trend(start_date, end_date, pen_id)
+        return Response(trend_data)
+
+    @action(detail=False, methods=['get'])
+    def dashboard_summary(self, request):
+        """获取仪表板健康评分汇总"""
+        target_date = request.query_params.get('date')
+        date_obj = None
+        if target_date:
+            try:
+                date_obj = datetime.strptime(target_date, '%Y-%m-%d').date()
+            except ValueError:
+                return Response(
+                    {'error': '日期格式错误'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        summary = health_score_service.get_dashboard_summary(date_obj)
+        return Response(summary)
+
+    @action(detail=False, methods=['post'])
+    def recalculate(self, request):
+        """
+        重新计算指定日期的健康评分（仅管理员）
+        参数:
+            date: 日期 (YYYY-MM-DD)
+            pen_id: 栏区ID，可选，不填则重算所有栏区
+        """
+        if not IsAdmin().has_permission(request, self):
+            return Response(
+                {'error': '仅管理员可执行此操作'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        target_date = request.data.get('date', timezone.now().date().isoformat())
+        pen_id = request.data.get('pen_id')
+
+        try:
+            date_obj = datetime.strptime(target_date, '%Y-%m-%d').date()
+        except ValueError:
+            return Response(
+                {'error': '日期格式错误，请使用 YYYY-MM-DD 格式'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if pen_id:
+            try:
+                pen_id = int(pen_id)
+            except (ValueError, TypeError):
+                return Response(
+                    {'error': 'pen_id 必须是整数'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        records = health_score_service.calculate_and_save_daily_scores(date_obj, pen_id)
+        serializer = HealthScoreRecordListSerializer(records, many=True)
+        return Response({
+            'message': '评分重算成功',
+            'date': date_obj.isoformat(),
+            'records_count': len(records),
+            'records': serializer.data
+        })
+
+    @action(detail=True, methods=['post'])
+    def manual_adjust(self, request, pk=None):
+        """
+        手动调整评分（仅管理员）
+        参数:
+            score_value: 调整分值，正数加分，负数扣分
+            description: 调整原因
+        """
+        if not IsAdmin().has_permission(request, self):
+            return Response(
+                {'error': '仅管理员可执行此操作'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        try:
+            record = HealthScoreRecord.objects.get(id=pk)
+        except HealthScoreRecord.DoesNotExist:
+            return Response(
+                {'error': '评分记录不存在'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        serializer = HealthScoreManualAdjustSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        score_value = serializer.validated_data['score_value']
+        description = serializer.validated_data['description']
+
+        from .models import HealthScoreDetail
+        detail_type = 'ADDITION' if score_value >= 0 else 'DEDUCTION'
+
+        HealthScoreDetail.objects.create(
+            score_record=record,
+            score_type=detail_type,
+            source_type='manual_adjust',
+            score_value=abs(score_value),
+            description=description,
+            rectification_status='rectified',
+            rectified_at=timezone.now(),
+            operator=request.user,
+        )
+
+        if score_value >= 0:
+            record.addition += score_value
+        else:
+            record.deduction += abs(score_value)
+
+        record.total_score = round(max(0, min(100, record.base_score - record.deduction + record.addition)), 2)
+        record.risk_level = health_score_service._get_risk_level(record.total_score)
+        record.save()
+
+        return Response({
+            'message': '评分调整成功',
+            'record_id': record.id,
+            'new_score': record.total_score,
+            'risk_level': record.risk_level
+        })
+
+
+class HealthScoreDetailViewSet(viewsets.GenericViewSet):
+    """健康评分明细查看接口 - 用于查看扣分原因和整改状态"""
+    permission_classes = [IsAuthenticated, CanViewReports]
+    queryset = HealthScoreDetail.objects.none()
+
+    def list(self, request, *args, **kwargs):
+        """
+        获取评分明细列表
+        参数:
+            score_record_id: 评分记录ID
+            source_type: 来源类型
+            rectification_status: 整改状态 (pending/rectified)
+            pen_id: 栏区ID
+            date: 日期 (YYYY-MM-DD)
+        """
+        queryset = HealthScoreDetail.objects.all().select_related(
+            'score_record__pen', 'inspection_item', 'incident', 'operator'
+        ).order_by('-created_at')
+
+        score_record_id = request.query_params.get('score_record_id')
+        source_type = request.query_params.get('source_type')
+        rectification_status = request.query_params.get('rectification_status')
+        pen_id = request.query_params.get('pen_id')
+        target_date = request.query_params.get('date')
+
+        if score_record_id:
+            try:
+                queryset = queryset.filter(score_record_id=int(score_record_id))
+            except (ValueError, TypeError):
+                return Response(
+                    {'error': 'score_record_id 必须是整数'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        if source_type:
+            queryset = queryset.filter(source_type=source_type)
+
+        if rectification_status:
+            queryset = queryset.filter(rectification_status=rectification_status)
+
+        if pen_id:
+            try:
+                queryset = queryset.filter(score_record__pen_id=int(pen_id))
+            except (ValueError, TypeError):
+                return Response(
+                    {'error': 'pen_id 必须是整数'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        if target_date:
+            try:
+                date_obj = datetime.strptime(target_date, '%Y-%m-%d').date()
+                queryset = queryset.filter(score_record__score_date=date_obj)
+            except ValueError:
+                return Response(
+                    {'error': '日期格式错误'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = HealthScoreDetailSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = HealthScoreDetailSerializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def update_rectification(self, request, pk=None):
+        """
+        更新整改状态（管理员或现场人员）
+        参数:
+            rectification_status: 整改状态
+        """
+        if not CanExportReports and not request.user.role == 'FIELD_WORKER':
+            pass
+
+        try:
+            detail = HealthScoreDetail.objects.get(id=pk)
+        except HealthScoreDetail.DoesNotExist:
+            return Response(
+                {'error': '评分明细不存在'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        new_status = request.data.get('rectification_status')
+        if not new_status:
+            return Response(
+                {'error': '必须提供 rectification_status'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        detail.rectification_status = new_status
+        if new_status == 'rectified':
+            detail.rectified_at = timezone.now()
+            detail.operator = request.user
+        detail.save()
+
+        serializer = HealthScoreDetailSerializer(detail)
+        return Response(serializer.data)
