@@ -318,3 +318,28 @@ class IncidentUpdate(models.Model):
 
     def __str__(self):
         return f'{self.incident.title} - {self.old_status} -> {self.new_status}'
+
+
+class DailySnapshot(models.Model):
+    """
+    历史日报快照缓存 - 保存首次生成的历史快照，避免当前配置变更影响历史回看
+    """
+    snapshot_date = models.DateField(verbose_name='快照日期')
+    pen_filter_key = models.CharField(max_length=50, default='all', verbose_name='栏区筛选键')
+    data = models.JSONField(verbose_name='快照数据')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        verbose_name = '历史日报快照'
+        verbose_name_plural = verbose_name
+        ordering = ['-snapshot_date', 'pen_filter_key']
+        constraints = [
+            models.UniqueConstraint(fields=['snapshot_date', 'pen_filter_key'], name='unique_daily_snapshot_filter'),
+        ]
+        indexes = [
+            models.Index(fields=['snapshot_date', 'pen_filter_key']),
+        ]
+
+    def __str__(self):
+        return f'{self.snapshot_date} - {self.pen_filter_key}'

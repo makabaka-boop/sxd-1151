@@ -5,7 +5,7 @@ from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from .models import (
     User, Pen, InspectionItem, InspectionRecord, InspectionItemValue,
-    FeedingRecord, CleaningRecord, Incident, IncidentUpdate
+    FeedingRecord, CleaningRecord, Incident, IncidentUpdate, DailySnapshot
 )
 
 
@@ -98,3 +98,12 @@ class IncidentAdmin(admin.ModelAdmin):
     ordering = ('-incident_time',)
     inlines = [IncidentUpdateInline]
     readonly_fields = ('created_at', 'updated_at')
+
+
+@admin.register(DailySnapshot)
+class DailySnapshotAdmin(admin.ModelAdmin):
+    list_display = ('snapshot_date', 'pen_filter_key', 'created_at', 'updated_at')
+    list_filter = ('snapshot_date',)
+    search_fields = ('pen_filter_key',)
+    ordering = ('-snapshot_date', 'pen_filter_key')
+    readonly_fields = ('snapshot_date', 'pen_filter_key', 'data', 'created_at', 'updated_at')

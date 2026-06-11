@@ -8,7 +8,7 @@ from django.utils import timezone
 from collections import defaultdict
 from .models import (
     Pen, InspectionItem, InspectionRecord, InspectionItemValue,
-    FeedingRecord, CleaningRecord, Incident, IncidentUpdate
+    FeedingRecord, CleaningRecord, Incident, IncidentUpdate, DailySnapshot
 )
 
 
@@ -38,6 +38,37 @@ class SnapshotService:
 
     @classmethod
     def calculate_daily_snapshot(cls, target_date, pen_id=None):
+        target_date, start_dt, end_dt = cls._get_date_range(target_date)
+        pen_filter_key = str(pen_id) if pen_id else 'all'
+
+        today = timezone.now().date()
+        if target_date < today:
+            saved_snapshot = DailySnapshot.objects.filter(
+                snapshot_date=target_date,
+                pen_filter_key=pen_filter_key
+            ).first()
+            if saved_snapshot:
+                return saved_snapshot.data
+
+            snapshot = cls._calculate_daily_snapshot(target_date, start_dt, end_dt, pen_id)
+            saved_snapshot, _ = DailySnapshot.objects.get_or_create(
+                snapshot_date=target_date,
+                pen_filter_key=pen_filter_key,
+                defaults={'data': snapshot}
+            )
+            return saved_snapshot.data
+
+        snapshot = cls._calculate_daily_snapshot(target_date, start_dt, end_dt, pen_id)
+        if target_date == today:
+            DailySnapshot.objects.update_or_create(
+                snapshot_date=target_date,
+                pen_filter_key=pen_filter_key,
+                defaults={'data': snapshot}
+            )
+        return snapshot
+
+    @classmethod
+    def _calculate_daily_snapshot(cls, target_date, start_dt, end_dt, pen_id=None):
         """
         计算指定日期的快照
         核心逻辑：
@@ -48,8 +79,6 @@ class SnapshotService:
 
         注意：使用 select_related 和 prefetch_related 优化查询，然后在内存中聚合
         """
-        target_date, start_dt, end_dt = cls._get_date_range(target_date)
-
         pens = cls._get_active_pens()
         if pen_id:
             pens = pens.filter(id=pen_id)
