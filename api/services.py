@@ -604,6 +604,17 @@ class HealthScoreService:
                 }
             )
 
+        from .models import HealthScoreInspectionItem, InspectionItem
+        active_items = InspectionItem.objects.filter(is_active=True)
+        for item in active_items:
+            HealthScoreInspectionItem.objects.get_or_create(
+                inspection_item=item,
+                defaults={
+                    'penalty_per_abnormal': 5.0,
+                    'is_enabled': True
+                }
+            )
+
     @classmethod
     def _get_date_range(cls, target_date):
         from datetime import datetime, timedelta
@@ -634,6 +645,59 @@ class HealthScoreService:
             if threshold.min_score <= score < threshold.max_score:
                 return threshold.risk_level
         return 'NORMAL'
+
+    @classmethod
+    def _get_incident_status_at_date(cls, incident, target_date):
+        """
+        计算异常事件在指定日期的状态（基于 IncidentUpdate 历史记录）
+        与 SnapshotService 保持一致，确保历史评分准确
+        """
+        from datetime import datetime
+        from django.utils import timezone
+        target_end = datetime.combine(target_date, datetime.max.time())
+        target_end = timezone.make_aware(target_end)
+
+        if incident.incident_time > target_end:
+            return None
+
+        last_update_before = None
+        for update in incident.updates.all().order_by('created_at'):
+            if update.created_at <= target_end:
+                last_update_before = update
+
+        if last_update_before:
+            return last_update_before.new_status
+
+        if incident.resolved_time and incident.resolved_time <= target_end:
+            return incident.status
+
+        if incident.incident_time <= target_end:
+            return 'OPEN'
+
+        return None
+
+    @classmethod
+    def _is_resolved_on_date(cls, incident, target_date):
+        """判断事件是否在指定日期当天被解决/关闭"""
+        from datetime import datetime, timedelta
+        from django.utils import timezone
+
+        if isinstance(target_date, str):
+            target_date = datetime.strptime(target_date, '%Y-%m-%d').date()
+        start_dt = datetime.combine(target_date, datetime.min.time())
+        end_dt = start_dt + timedelta(days=1)
+        start_dt = timezone.make_aware(start_dt)
+        end_dt = timezone.make_aware(end_dt)
+
+        if incident.resolved_time and start_dt <= incident.resolved_time < end_dt:
+            return True
+
+        for update in incident.updates.all().order_by('created_at'):
+            if start_dt <= update.created_at < end_dt:
+                if update.new_status in ['RESOLVED', 'CLOSED']:
+                    return True
+
+        return False
 
     @classmethod
     def calculate_pen_score(cls, pen, target_date):
@@ -672,17 +736,19 @@ class HealthScoreService:
                 record__inspection_time__lt=end_dt
             ).select_related('inspection_item', 'record')
 
-            abnormal_count = 0
-            inspection_deduction = 0.0
-
             enabled_items = HealthScoreInspectionItem.objects.filter(
                 is_enabled=True
             ).values_list('inspection_item_id', 'penalty_per_abnormal')
             penalty_map = dict(enabled_items)
 
+            abnormal_count = 0
+            inspection_deduction = 0.0
+
             for item_value in abnormal_items:
+                if item_value.inspection_item_id not in penalty_map:
+                    continue
                 abnormal_count += 1
-                penalty = penalty_map.get(item_value.inspection_item_id, 5.0)
+                penalty = penalty_map[item_value.inspection_item_id]
                 actual_deduction = min(penalty * (dim_weight / 100), weighted_base / max(abnormal_count, 1))
                 inspection_deduction += actual_deduction
 
@@ -701,19 +767,23 @@ class HealthScoreService:
             dimension_counts['inspection_abnormal_count'] = abnormal_count
             total_deduction += inspection_deduction
 
-        # 2. 未处理异常事件扣分
+        # 2. 未处理异常事件扣分（按历史日期状态计算）
         if 'open_incidents' in dim_map:
             dim_weight = dim_map['open_incidents'].weight
             weighted_base = base_score * (dim_weight / total_weight)
 
-            open_incidents = Incident.objects.filter(
+            all_incidents = Incident.objects.filter(
                 pen=pen,
-                status__in=['OPEN', 'IN_PROGRESS']
-            ).filter(
                 incident_time__lt=end_dt
-            ).select_related('reporter', 'handler')
+            ).select_related('reporter', 'handler').prefetch_related('updates')
 
-            open_count = open_incidents.count()
+            open_incidents = []
+            for incident in all_incidents:
+                status_at_date = cls._get_incident_status_at_date(incident, target_date)
+                if status_at_date in ['OPEN', 'IN_PROGRESS']:
+                    open_incidents.append(incident)
+
+            open_count = len(open_incidents)
             incidents_deduction = 0.0
             penalty_per_incident = 10.0 * (dim_weight / 100)
 
@@ -843,27 +913,26 @@ class HealthScoreService:
             dimension_scores['capacity_ratio_score'] = round(capacity_score, 2)
             dimension_counts['capacity_ratio'] = round(capacity_ratio, 2)
 
-        # 检查当日已解决的异常事件，添加恢复加分
-        resolved_incidents = Incident.objects.filter(
+        # 检查当日已解决的异常事件，添加恢复加分（按历史状态判断）
+        all_incidents = Incident.objects.filter(
             pen=pen,
-            status__in=['RESOLVED', 'CLOSED'],
-            resolved_time__gte=start_dt,
-            resolved_time__lt=end_dt
-        ).select_related('reporter', 'handler')
+            incident_time__lt=end_dt
+        ).select_related('reporter', 'handler').prefetch_related('updates')
 
-        for incident in resolved_incidents:
-            recovery_score = min(3.0, 5.0)
-            total_addition += recovery_score
-            score_details_data.append({
-                'score_type': 'RECOVERY',
-                'source_type': 'incident_resolved',
-                'score_value': round(recovery_score, 2),
-                'description': f'异常事件已解决: {incident.title}',
-                'source_id': incident.id,
-                'inspection_item': None,
-                'incident': incident,
-                'rectification_status': 'rectified',
-            })
+        for incident in all_incidents:
+            if cls._is_resolved_on_date(incident, target_date):
+                recovery_score = min(3.0, 5.0)
+                total_addition += recovery_score
+                score_details_data.append({
+                    'score_type': 'RECOVERY',
+                    'source_type': 'incident_resolved',
+                    'score_value': round(recovery_score, 2),
+                    'description': f'异常事件已解决: {incident.title}',
+                    'source_id': incident.id,
+                    'inspection_item': None,
+                    'incident': incident,
+                    'rectification_status': 'rectified',
+                })
 
         total_score = round(max(0, min(100, base_score - total_deduction + total_addition)), 2)
         risk_level = cls._get_risk_level(total_score)
